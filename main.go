@@ -51,8 +51,18 @@ func handleKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleKeyByID(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	id, err := strconv.Atoi(parts[len(parts)-1])
+	// strip trailing slash — /api/keys/ becomes /api/keys
+	path := strings.TrimRight(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+
+	// if nothing after /api/keys, redirect to the collection handler
+	lastPart := parts[len(parts)-1]
+	if lastPart == "keys" {
+		handleKeys(w, r)
+		return
+	}
+
+	id, err := strconv.Atoi(lastPart)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid id")
 		return
