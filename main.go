@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type APIKey struct {
+type ApiKey struct {
 	ID        int       `json:"id"`
 	Name      string    `json:"name"`
 	KeyValue  string    `json:"keyValue"`
@@ -23,16 +27,7 @@ type CreateKeyRequest struct {
 	Owner string `json:"owner"`
 }
 
-// In-memory store - no database yet
-var (
-	keys   = make(map[int]APIKey)
-	nextID = 1
-	mu     sync.Mutex
-)
-
-func generateKey() string {
-	return fmt.Sprintf("%d-key-%d", time.Now().UnixNano(), nextID)
-}
+var db *pgxpool.Pool
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -51,36 +46,45 @@ func handleKeys(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		createKey(w, r)
 	default:
-		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
 func handleKeyByID(w http.ResponseWriter, r *http.Request) {
-	// extract ID from path: /api/keys/123
 	parts := strings.Split(r.URL.Path, "/")
 	id, err := strconv.Atoi(parts[len(parts)-1])
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-
 	switch r.Method {
 	case http.MethodGet:
 		getKeyByID(w, r, id)
 	case http.MethodDelete:
-		deleteKeyByID(w, r, id)
+		deleteKey(w, r, id)
 	default:
-		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
 func getAllKeys(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	rows, err := db.Query(context.Background(),
+		"SELECT id, name, key_value, owner, created_at FROM api_keys ORDER BY id")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to fetch keys")
+		return
+	}
+	defer rows.Close()
 
-	result := make([]APIKey, 0, len(keys))
-	for _, key := range keys {
-		result = append(result, key)
+	result := make([]ApiKey, 0)
+	for rows.Next() {
+		var k ApiKey
+		err := rows.Scan(&k.ID, &k.Name, &k.KeyValue, &k.Owner, &k.CreatedAt)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to scan row")
+			return
+		}
+		result = append(result, k)
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -92,57 +96,76 @@ func createKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(req.Name) == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
+		writeError(w, http.StatusBadRequest, "name cannot be empty")
 		return
 	}
 	if strings.TrimSpace(req.Owner) == "" {
-		writeError(w, http.StatusBadRequest, "owner is required")
+		writeError(w, http.StatusBadRequest, "owner cannot be empty")
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	key := APIKey{
-		ID:        nextID,
-		Name:      req.Name,
-		KeyValue:  generateKey(),
-		Owner:     req.Owner,
-		CreatedAt: time.Now(),
-	}
-	keys[nextID] = key
-	nextID++
+	// keyValue := fmt.Sprintf("%d-key-%d", time.Now().UnixNano(), time.Now().Unix())
+	keyValue := strings.ReplaceAll(uuid.New().String(), "-", "")
 
+	var key ApiKey
+	err := db.QueryRow(context.Background(),
+		`INSERT INTO api_keys (name, key_value, owner)
+		 VALUES ($1, $2, $3)
+		 RETURNING id, name, key_value, owner, created_at`,
+		req.Name, keyValue, req.Owner,
+	).Scan(&key.ID, &key.Name, &key.KeyValue, &key.Owner, &key.CreatedAt)
+
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create key")
+		return
+	}
 	writeJSON(w, http.StatusCreated, key)
 }
 
 func getKeyByID(w http.ResponseWriter, r *http.Request, id int) {
-	mu.Lock()
-	defer mu.Unlock()
+	var key ApiKey
+	err := db.QueryRow(context.Background(),
+		"SELECT id, name, key_value, owner, created_at FROM api_keys WHERE id = $1",
+		id,
+	).Scan(&key.ID, &key.Name, &key.KeyValue, &key.Owner, &key.CreatedAt)
 
-	key, exists := keys[id]
-	if !exists {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("key not found with id: %d", id))
+	if err != nil {
+		writeError(w, http.StatusNotFound,
+			fmt.Sprintf("key not found with id: %d", id))
 		return
 	}
 	writeJSON(w, http.StatusOK, key)
 }
 
-func deleteKeyByID(w http.ResponseWriter, r *http.Request, id int) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	if _, exists := keys[id]; !exists {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("key not found with id: %d", id))
+func deleteKey(w http.ResponseWriter, r *http.Request, id int) {
+	result, err := db.Exec(context.Background(),
+		"DELETE FROM api_keys WHERE id = $1", id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete key")
 		return
 	}
-	delete(keys, id)
+	if result.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound,
+			fmt.Sprintf("key not found with id: %d", id))
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func main() {
-	http.HandleFunc("/api/keys", handleKeys)
-	http.HandleFunc("/api/keys/", handleKeyByID)
+	connStr := "postgres://postgres:root@localhost:5432/apikeymanager"
+	pool, err := pgxpool.New(context.Background(), connStr)
+	if err != nil {
+		log.Fatal("failed to connect to database:", err)
+	}
+	defer pool.Close()
 
-	fmt.Println("Server running on http://localhost:8080")
-	http.ListenAndServe(":8080", nil)
+	if err := pool.Ping(context.Background()); err != nil {
+		log.Fatal("database ping failed:", err)
+	}
+
+	db = pool
+	fmt.Println("Connected to PostgreSQL")
+	fmt.Println("Server running on http://localhost:8081")
+	log.Fatal(http.ListenAndServe(":8081", nil))
 }
