@@ -162,6 +162,15 @@ func deleteKey(w http.ResponseWriter, r *http.Request, id int) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next(w, r)
+		duration := time.Since(start)
+		log.Printf("%s %s — %dms", r.Method, r.URL.Path, duration.Milliseconds())
+	}
+}
+
 func main() {
 	connStr := "postgres://postgres:root@localhost:5432/apikeymanager"
 	pool, err := pgxpool.New(context.Background(), connStr)
@@ -175,6 +184,10 @@ func main() {
 	}
 
 	db = pool
+
+	http.HandleFunc("/api/keys", loggingMiddleware(handleKeys))
+	http.HandleFunc("/api/keys/", loggingMiddleware(handleKeyByID))
+
 	fmt.Println("Connected to PostgreSQL")
 	fmt.Println("Server running on http://localhost:8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
